@@ -47,7 +47,6 @@ FilterOptions InputArgsParser::parseArgs() {
 
   FilterOptions filterOptions;
 
-  // Parse input source
   std::string inputType = result["input"].as<std::string>();
   filterOptions.inputSource = stringToInputSource(inputType);
   filterOptions.inputPath = result["path"].as<std::string>();
@@ -70,19 +69,34 @@ FilterOptions InputArgsParser::parseArgs() {
   filterOptions.saturation = result["saturation"].as<float>();
   filterOptions.toneMappingAlgo = result["tone-algo"].as<int>();
 
+  filterOptions.targetFilter = result["target-filter"].as<std::string>();
+  filterOptions.transitionDurationMs = result["transition-duration"].as<int>();
+  
+  filterOptions.numStreams = result["streams"].as<int>();
+
   return filterOptions;
 }
 
 void InputArgsParser::setupOptions(cxxopts::Options &options) {
-  options.add_options()("i,input", "Input source: 'webcam', 'image', 'video', or 'synthetic'", cxxopts::value<std::string>()->default_value("webcam"))(
-      "p,path", "Path to input image or video file (when not using webcam)", cxxopts::value<std::string>()->default_value("test_image.jpg"))(
-      "s,synthetic", "Synthetic pattern type: 'checkerboard', 'gradient', 'noise'", cxxopts::value<std::string>()->default_value("checkerboard"))(
-      "d,device", "Camera device ID", cxxopts::value<int>()->default_value("0"))("f,filter", "Filter type: blur, sharpen, edge, emboss, hdr", cxxopts::value<std::string>()->default_value("blur"))(
-      "k,kernel-size", "Kernel size for filters", cxxopts::value<int>()->default_value("3"))("sigma", "Sigma value for Gaussian blur", cxxopts::value<float>()->default_value("1.0"))(
-      "intensity", "Filter intensity", cxxopts::value<float>()->default_value("1.0"))("preview", "Show original video alongside filtered")("h,help", "Print usage")(
-      "v,version", "Print version information")("exposure", "HDR Exposure level", cxxopts::value<float>()->default_value("1.0"))("gamma", "HDR Gamma correction",
-                                                                                                                                 cxxopts::value<float>()->default_value("2.2"))(
-      "saturation", "HDR Color saturation", cxxopts::value<float>()->default_value("1.0"))("tone-algo", "HDR Tone Mapping Algorithm (0: Global, 1: Local)", cxxopts::value<int>()->default_value("0"));
+  options.add_options()
+      ("i,input", "Input source: 'webcam', 'image', 'video', or 'synthetic'", cxxopts::value<std::string>()->default_value("webcam"))
+      ("p,path", "Path to input image or video file (when not using webcam)", cxxopts::value<std::string>()->default_value("test_image.jpg"))
+      ("s,synthetic", "Synthetic pattern type: 'checkerboard', 'gradient', 'noise'", cxxopts::value<std::string>()->default_value("checkerboard"))
+      ("d,device", "Camera device ID", cxxopts::value<int>()->default_value("0"))
+      ("f,filter", "Filter type: blur, sharpen, edge, emboss, hdr", cxxopts::value<std::string>()->default_value("blur"))
+      ("k,kernel-size", "Kernel size for filters", cxxopts::value<int>()->default_value("3"))
+      ("sigma", "Sigma value for Gaussian blur", cxxopts::value<float>()->default_value("1.0"))
+      ("intensity", "Filter intensity", cxxopts::value<float>()->default_value("1.0"))
+      ("preview", "Show original video alongside filtered")
+      ("h,help", "Print usage")
+      ("v,version", "Print version information")
+      ("exposure", "HDR Exposure level", cxxopts::value<float>()->default_value("1.0"))
+      ("gamma", "HDR Gamma correction", cxxopts::value<float>()->default_value("2.2"))
+      ("saturation", "HDR Color saturation", cxxopts::value<float>()->default_value("1.0"))
+      ("tone-algo", "HDR Tone Mapping Algorithm (0: Global, 1: Local)", cxxopts::value<int>()->default_value("0"))
+      ("target-filter", "Target filter for transition pipeline (e.g., edge, hdr, none)", cxxopts::value<std::string>()->default_value("none"))
+      ("transition-duration", "Duration of the wipe transition in milliseconds", cxxopts::value<int>()->default_value("2000"))
+      ("streams", "Number of parallel CUDA streams for chunk tiling", cxxopts::value<int>()->default_value("4"));
 }
 
 } // namespace cuda_filter

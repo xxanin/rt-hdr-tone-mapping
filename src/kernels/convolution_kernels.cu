@@ -15,12 +15,13 @@ namespace cuda_filter {
     }                                                                                                                                                                                                  \
   }
 
-__global__ void convolutionKernel(const unsigned char *input, unsigned char *output, const float *kernel, int width, int height, int channels, int kernelSize) {
+__global__ void convolutionKernel(const unsigned char *input, unsigned char *output, const float *kernel, int width, int height, int channels, int kernelSize, int y_offset, int chunk_height) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int y = blockIdx.y * blockDim.y + threadIdx.y + y_offset;
 
-  if (x >= width || y >= height)
+  if (x >= width || y >= height || y >= y_offset + chunk_height)
     return;
+
   int radius = kernelSize / 2;
 
   for (int c = 0; c < channels; c++) {
@@ -38,11 +39,11 @@ __global__ void convolutionKernel(const unsigned char *input, unsigned char *out
   }
 }
 
-__global__ void kernel_bgr_to_xyY(const unsigned char *input, float *d_x, float *d_y, float *d_Y, int width, int height, float gamma) {
+__global__ void kernel_bgr_to_xyY(const unsigned char *input, float *d_x, float *d_y, float *d_Y, int width, int height, float gamma, int y_offset, int chunk_height) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int y = blockIdx.y * blockDim.y + threadIdx.y + y_offset;
 
-  if (x < width && y < height) {
+  if (x < width && y < height && y < y_offset + chunk_height) {
     int idx_pixel = (y * width + x) * 3;
     int idx_flat = y * width + x;
 
@@ -63,11 +64,11 @@ __global__ void kernel_bgr_to_xyY(const unsigned char *input, float *d_x, float 
   }
 }
 
-__global__ void kernel_global_tone_map(float *d_Y, int width, int height, float exposure) {
+__global__ void kernel_global_tone_map(float *d_Y, int width, int height, float exposure, int y_offset, int chunk_height) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int y = blockIdx.y * blockDim.y + threadIdx.y + y_offset;
 
-  if (x < width && y < height) {
+  if (x < width && y < height && y < y_offset + chunk_height) {
     int idx = y * width + x;
     float Y = d_Y[idx];
     d_Y[idx] = 1.0f - expf(-exposure * Y);
@@ -78,14 +79,14 @@ __global__ void kernel_global_tone_map(float *d_Y, int width, int height, float 
 #define BLOCK_DIM 16
 #define SHARED_DIM (BLOCK_DIM + 2 * BLUR_RADIUS)
 
-__global__ void kernel_shared_memory_blur(const float *d_Y_in, float *d_Y_out, int width, int height) {
+__global__ void kernel_shared_memory_blur(const float *d_Y_in, float *d_Y_out, int width, int height, int y_offset, int chunk_height) {
   __shared__ float s_Y[SHARED_DIM][SHARED_DIM];
 
   int tx = threadIdx.x;
   int ty = threadIdx.y;
 
   int x = blockIdx.x * blockDim.x + tx;
-  int y = blockIdx.y * blockDim.y + ty;
+  int y = blockIdx.y * blockDim.y + ty + y_offset;
 
   int x_left = max(0, x - BLUR_RADIUS);
   int x_right = min(width - 1, x + BLUR_RADIUS);
@@ -111,7 +112,7 @@ __global__ void kernel_shared_memory_blur(const float *d_Y_in, float *d_Y_out, i
 
   __syncthreads();
 
-  if (x < width && y < height) {
+  if (x < width && y < height && y < y_offset + chunk_height) {
     float sum = 0.0f;
     int count = 0;
 
@@ -125,11 +126,11 @@ __global__ void kernel_shared_memory_blur(const float *d_Y_in, float *d_Y_out, i
   }
 }
 
-__global__ void kernel_local_tone_map(float *d_Y, const float *d_Y_blurred, int width, int height, float exposure) {
+__global__ void kernel_local_tone_map(float *d_Y, const float *d_Y_blurred, int width, int height, float exposure, int y_offset, int chunk_height) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int y = blockIdx.y * blockDim.y + threadIdx.y + y_offset;
 
-  if (x < width && y < height) {
+  if (x < width && y < height && y < y_offset + chunk_height) {
     int idx = y * width + x;
     float Y_orig = d_Y[idx];
     float Y_base = d_Y_blurred[idx];
@@ -142,11 +143,11 @@ __global__ void kernel_local_tone_map(float *d_Y, const float *d_Y_blurred, int 
   }
 }
 
-__global__ void kernel_xyY_to_bgr(unsigned char *output, float *d_x, float *d_y, float *d_Y, int width, int height, float gamma, float saturation) {
+__global__ void kernel_xyY_to_bgr(unsigned char *output, float *d_x, float *d_y, float *d_Y, int width, int height, float gamma, float saturation, int y_offset, int chunk_height) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int y = blockIdx.y * blockDim.y + threadIdx.y + y_offset;
 
-  if (x < width && y < height) {
+  if (x < width && y < height && y < y_offset + chunk_height) {
     int idx_pixel = (y * width + x) * 3;
     int idx_flat = y * width + x;
 
@@ -179,83 +180,22 @@ __global__ void kernel_xyY_to_bgr(unsigned char *output, float *d_x, float *d_y,
   }
 }
 
-void applyFilterGPU(const cv::Mat &input, cv::Mat &output, const cv::Mat &kernel, const FilterOptions &options) {
-  if (input.empty())
+__global__ void wipeTransitionKernel(const unsigned char *d_imgA, const unsigned char *d_imgB, unsigned char *d_output, int width, int height, int channels, int wipe_x) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (x >= width || y >= height)
     return;
-  output.create(input.size(), input.type());
 
-  int width = input.cols;
-  int height = input.rows;
-  int channels = input.channels();
-  size_t imageSize = width * height * channels * sizeof(unsigned char);
-  size_t flatSize = width * height * sizeof(float);
+  int pixel_idx = (y * width + x) * channels;
 
-  unsigned char *d_input = nullptr, *d_output = nullptr;
-  CHECK_CUDA_ERROR(cudaMalloc(&d_input, imageSize));
-  CHECK_CUDA_ERROR(cudaMalloc(&d_output, imageSize));
-  CHECK_CUDA_ERROR(cudaMemcpy(d_input, input.data, imageSize, cudaMemcpyHostToDevice));
-
-  dim3 blockDim(16, 16);
-  dim3 gridDim(cuda::divUp(width, blockDim.x), cuda::divUp(height, blockDim.y));
-
-  if (options.filterType == "hdr") {
-    float *d_x = nullptr, *d_y = nullptr, *d_Y = nullptr;
-    CHECK_CUDA_ERROR(cudaMalloc(&d_x, flatSize));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_y, flatSize));
-    CHECK_CUDA_ERROR(cudaMalloc(&d_Y, flatSize));
-
-    kernel_bgr_to_xyY<<<gridDim, blockDim>>>(d_input, d_x, d_y, d_Y, width, height, options.gamma);
-    CHECK_CUDA_ERROR(cudaGetLastError());
-
-    if (options.toneMappingAlgo == 1) {
-      float *d_Y_blurred = nullptr;
-      CHECK_CUDA_ERROR(cudaMalloc(&d_Y_blurred, flatSize));
-
-      kernel_shared_memory_blur<<<gridDim, blockDim>>>(d_Y, d_Y_blurred, width, height);
-      CHECK_CUDA_ERROR(cudaGetLastError());
-
-      kernel_local_tone_map<<<gridDim, blockDim>>>(d_Y, d_Y_blurred, width, height, options.exposure);
-      CHECK_CUDA_ERROR(cudaGetLastError());
-
-      cudaFree(d_Y_blurred);
+  for (int c = 0; c < channels; ++c) {
+    if (x < wipe_x) {
+      d_output[pixel_idx + c] = d_imgB[pixel_idx + c];
     } else {
-      kernel_global_tone_map<<<gridDim, blockDim>>>(d_Y, width, height, options.exposure);
-      CHECK_CUDA_ERROR(cudaGetLastError());
+      d_output[pixel_idx + c] = d_imgA[pixel_idx + c];
     }
-
-    kernel_xyY_to_bgr<<<gridDim, blockDim>>>(d_output, d_x, d_y, d_Y, width, height, options.gamma, options.saturation);
-    CHECK_CUDA_ERROR(cudaGetLastError());
-
-    cudaFree(d_x);
-    cudaFree(d_y);
-    cudaFree(d_Y);
-  } else {
-    // RESTORED FALLBACK FOR NORMAL FILTERS (Blur, Edge Detection, etc.)
-    float *d_kernel = nullptr;
-    int kernelSize = kernel.rows;
-    size_t kernelSize_bytes = kernelSize * kernelSize * sizeof(float);
-
-    float *h_kernel = new float[kernelSize * kernelSize];
-    for (int i = 0; i < kernelSize; i++) {
-      for (int j = 0; j < kernelSize; j++) {
-        h_kernel[i * kernelSize + j] = kernel.at<float>(i, j);
-      }
-    }
-
-    CHECK_CUDA_ERROR(cudaMalloc(&d_kernel, kernelSize_bytes));
-    CHECK_CUDA_ERROR(cudaMemcpy(d_kernel, h_kernel, kernelSize_bytes, cudaMemcpyHostToDevice));
-
-    convolutionKernel<<<gridDim, blockDim>>>(d_input, d_output, d_kernel, width, height, channels, kernelSize);
-    CHECK_CUDA_ERROR(cudaGetLastError());
-
-    cudaFree(d_kernel);
-    delete[] h_kernel;
   }
-
-  CHECK_CUDA_ERROR(cudaDeviceSynchronize());
-  CHECK_CUDA_ERROR(cudaMemcpy(output.data, d_output, imageSize, cudaMemcpyDeviceToHost));
-  cudaFree(d_input);
-  cudaFree(d_output);
 }
 
 void applyFilterCPU(const cv::Mat &input, cv::Mat &output, const cv::Mat &kernel, const FilterOptions &options) {
@@ -270,12 +210,10 @@ void applyFilterCPU(const cv::Mat &input, cv::Mat &output, const cv::Mat &kernel
     float x_white = 0.3127f;
     float y_white = 0.3290f;
 
-    // Temporary matrices to hold the channels
     cv::Mat Y_mat(height, width, CV_32F);
     cv::Mat x_mat(height, width, CV_32F);
     cv::Mat y_mat(height, width, CV_32F);
 
-    // Pass 1: BGR to xyY
     for (int y = 0; y < height; ++y) {
       for (int x = 0; x < width; ++x) {
         cv::Vec3b pixel = input.at<cv::Vec3b>(y, x);
@@ -296,38 +234,31 @@ void applyFilterCPU(const cv::Mat &input, cv::Mat &output, const cv::Mat &kernel
       }
     }
 
-    // Optional Base Layer Blur for Local Tone Mapping
     cv::Mat Y_base;
     if (options.toneMappingAlgo == 1) {
-      // A 9x9 blur roughly matches our BLUR_RADIUS 4 on the GPU
       cv::blur(Y_mat, Y_base, cv::Size(9, 9));
     }
 
-    // Pass 2: Tone Map and Convert Back
     for (int y = 0; y < height; ++y) {
       for (int x = 0; x < width; ++x) {
         float Y_orig = Y_mat.at<float>(y, x);
         float x_chroma = x_mat.at<float>(y, x);
         float y_chroma = y_mat.at<float>(y, x);
 
-        // Saturation
         x_chroma = x_white + options.saturation * (x_chroma - x_white);
         y_chroma = y_white + options.saturation * (y_chroma - y_white);
         y_chroma = (y_chroma <= 0.0f) ? 1e-6f : y_chroma;
 
         float Y_mapped;
         if (options.toneMappingAlgo == 1) {
-          // Local Tone Mapping Math
           float Y_blurred = Y_base.at<float>(y, x);
           float detail = Y_orig - Y_blurred;
           float compressed = 1.0f - std::exp(-options.exposure * Y_blurred);
           Y_mapped = std::max(0.0f, compressed + detail);
         } else {
-          // Global Tone Mapping Math
           Y_mapped = 1.0f - std::exp(-options.exposure * Y_orig);
         }
 
-        // xyY to RGB
         float X_new = (Y_mapped / y_chroma) * x_chroma;
         float Z_new = (Y_mapped / y_chroma) * (1.0f - x_chroma - y_chroma);
 
@@ -344,4 +275,127 @@ void applyFilterCPU(const cv::Mat &input, cv::Mat &output, const cv::Mat &kernel
     cv::filter2D(input, output, -1, kernel);
   }
 }
+
+void applyFilterGPU(const cv::Mat &input, cv::Mat &output, const cv::Mat &kernel, const FilterOptions &options) {}
+
+void initPipelineGPU(FilterPipeline &pipeline, int width, int height, int channels, unsigned char **d_bufA, unsigned char **d_bufB) {
+  size_t imageSize = width * height * channels * sizeof(unsigned char);
+  size_t flatSize = width * height * sizeof(float);
+
+  CHECK_CUDA_ERROR(cudaMalloc(d_bufA, imageSize));
+  CHECK_CUDA_ERROR(cudaMalloc(d_bufB, imageSize));
+
+  for (size_t i = 0; i < pipeline.size(); ++i) {
+    FilterStage &stage = pipeline.getStage(i);
+
+    if (stage.type == FilterType::HDR_TONEMAPPING) {
+      CHECK_CUDA_ERROR(cudaMalloc(&stage.d_x, flatSize));
+      CHECK_CUDA_ERROR(cudaMalloc(&stage.d_y, flatSize));
+      CHECK_CUDA_ERROR(cudaMalloc(&stage.d_Y, flatSize));
+
+      if (stage.options.toneMappingAlgo == 1) {
+        CHECK_CUDA_ERROR(cudaMalloc(&stage.d_Y_blurred, flatSize));
+      }
+    } else {
+      int kSize = stage.kernelSize;
+      size_t kBytes = kSize * kSize * sizeof(float);
+
+      float *h_kernel_flat = new float[kSize * kSize];
+      for (int r = 0; r < kSize; r++) {
+        for (int c = 0; c < kSize; c++) {
+          h_kernel_flat[r * kSize + c] = stage.h_kernel.at<float>(r, c);
+        }
+      }
+
+      CHECK_CUDA_ERROR(cudaMalloc(&stage.d_kernel, kBytes));
+      CHECK_CUDA_ERROR(cudaMemcpy(stage.d_kernel, h_kernel_flat, kBytes, cudaMemcpyHostToDevice));
+
+      delete[] h_kernel_flat;
+    }
+  }
+}
+
+void applyPipelineGPU(const cv::Mat &input, cv::Mat &output, FilterPipeline &pipeline, unsigned char *d_bufA, unsigned char *d_bufB) {
+  if (input.empty() || pipeline.size() == 0)
+    return;
+  output.create(input.size(), input.type());
+
+  int width = input.cols;
+  int height = input.rows;
+  int channels = input.channels();
+  size_t imageSize = width * height * channels * sizeof(unsigned char);
+
+  dim3 blockDim(16, 16);
+
+  CHECK_CUDA_ERROR(cudaMemcpy(d_bufA, input.data, imageSize, cudaMemcpyHostToDevice));
+
+  int chunkHeight = cuda::divUp(height, pipeline.numStreams);
+
+  for (int s = 0; s < pipeline.numStreams; ++s) {
+
+    int y_offset = s * chunkHeight;
+    int currentChunkHeight = std::min(chunkHeight, height - y_offset);
+    if (currentChunkHeight <= 0)
+      continue;
+
+    dim3 gridDimChunk(cuda::divUp(width, blockDim.x), cuda::divUp(currentChunkHeight, blockDim.y));
+
+    unsigned char *d_current_in = d_bufA;
+    unsigned char *d_current_out = d_bufB;
+
+    for (size_t i = 0; i < pipeline.size(); ++i) {
+      FilterStage &stage = pipeline.getStage(i);
+
+      if (stage.type == FilterType::HDR_TONEMAPPING) {
+
+        kernel_bgr_to_xyY<<<gridDimChunk, blockDim, 0, pipeline.streams[s]>>>(d_current_in, stage.d_x, stage.d_y, stage.d_Y, width, height, stage.options.gamma, y_offset, currentChunkHeight);
+        CHECK_CUDA_ERROR(cudaGetLastError());
+
+        if (stage.options.toneMappingAlgo == 1) {
+          kernel_shared_memory_blur<<<gridDimChunk, blockDim, 0, pipeline.streams[s]>>>(stage.d_Y, stage.d_Y_blurred, width, height, y_offset, currentChunkHeight);
+          CHECK_CUDA_ERROR(cudaGetLastError());
+
+          kernel_local_tone_map<<<gridDimChunk, blockDim, 0, pipeline.streams[s]>>>(stage.d_Y, stage.d_Y_blurred, width, height, stage.options.exposure, y_offset, currentChunkHeight);
+          CHECK_CUDA_ERROR(cudaGetLastError());
+        } else {
+          kernel_global_tone_map<<<gridDimChunk, blockDim, 0, pipeline.streams[s]>>>(stage.d_Y, width, height, stage.options.exposure, y_offset, currentChunkHeight);
+          CHECK_CUDA_ERROR(cudaGetLastError());
+        }
+
+        kernel_xyY_to_bgr<<<gridDimChunk, blockDim, 0, pipeline.streams[s]>>>(d_current_out, stage.d_x, stage.d_y, stage.d_Y, width, height, stage.options.gamma, stage.options.saturation, y_offset,
+                                                                              currentChunkHeight);
+        CHECK_CUDA_ERROR(cudaGetLastError());
+
+      } else {
+        convolutionKernel<<<gridDimChunk, blockDim, 0, pipeline.streams[s]>>>(d_current_in, d_current_out, stage.d_kernel, width, height, channels, stage.kernelSize, y_offset, currentChunkHeight);
+      }
+
+      CHECK_CUDA_ERROR(cudaGetLastError());
+      std::swap(d_current_in, d_current_out);
+    }
+  }
+
+  CHECK_CUDA_ERROR(cudaDeviceSynchronize());
+
+  unsigned char *final_out = (pipeline.size() % 2 == 0) ? d_bufA : d_bufB;
+  CHECK_CUDA_ERROR(cudaMemcpy(output.data, final_out, imageSize, cudaMemcpyDeviceToHost));
+}
+
+void cleanupPipelineGPU(unsigned char *d_bufA, unsigned char *d_bufB) {
+  if (d_bufA)
+    cudaFree(d_bufA);
+  if (d_bufB)
+    cudaFree(d_bufB);
+}
+
+void applyWipeTransitionGPU(const unsigned char *d_imgA, const unsigned char *d_imgB, unsigned char *d_output, int width, int height, int channels, int wipe_x) {
+
+  dim3 blockDim(16, 16);
+  dim3 gridDim(cuda::divUp(width, blockDim.x), cuda::divUp(height, blockDim.y));
+
+  wipeTransitionKernel<<<gridDim, blockDim>>>(d_imgA, d_imgB, d_output, width, height, channels, wipe_x);
+
+  CHECK_CUDA_ERROR(cudaGetLastError());
+}
+
 } // namespace cuda_filter
